@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.38"
+d1x_protocol = { path = "../d1x_protocol" }
 serde_json = "1.0.133"
 termcolor = "1.4.1"
 tokio = { version = "1.41.1", features = ["full"] }

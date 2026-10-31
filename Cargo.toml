@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "d1x",
     "d1x_client",
+    "d1x_protocol",
 ]

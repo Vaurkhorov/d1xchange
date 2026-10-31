@@ -1,5 +1,6 @@
 mod types;
 
+use d1x_protocol::{Request, Response};
 use std::collections::HashMap;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -265,16 +266,17 @@ async fn connection_handler(id: usize, tx: mpsc::Sender<(usize, Query)>, mut rx:
         select! {
             query_response = rx.recv() => {
                 let response = match query_response {
-                    Some(r) => r,
+                    Some(r) => r.to_wire(),
                     None => {
                         // The market should not be closed before sockets.
-                        socket.write(r#"{"response": "market closed"}"#.as_bytes()).await.map_err(|e| (id, e))?;
+                        let response = serde_json::to_string(&Response::MarketClosed).expect("Response serialization should not fail.");
+                        socket.write(response.as_bytes()).await.map_err(|e| (id, e))?;
                         socket.shutdown().await.map_err(|e| (id, e))?;
                         continue;
                     }
                 };
-        
-                let response = response.to_json();
+
+                let response = serde_json::to_string(&response).expect("Response serialization should not fail.");
                 if let Err(e) = socket.write_all(response.as_bytes()).await {
                     eprintln!("Error while writing to socket: {:#?}", &e);
                     break Err((id, e));
@@ -288,10 +290,12 @@ async fn connection_handler(id: usize, tx: mpsc::Sender<(usize, Query)>, mut rx:
                         break Ok(());
                     }
                     Ok(n) => {
-                        match Query::from_json(&message[0..n], id) {
-                            Some(q) => q,
-                            None => {
-                                socket.write(r#"{"response": "malformed request"}"#.as_bytes()).await.map_err(|e| (id, e))?;
+                        match serde_json::from_slice::<Request>(&socket_buffer[0..n]) {
+                            Ok(request) => Query::from_request(id, request),
+                            Err(e) => {
+                                println!("Error parsing JSON: {}", e);
+                                let response = serde_json::to_string(&Response::MalformedRequest).expect("Response serialization should not fail.");
+                                socket.write(response.as_bytes()).await.map_err(|e| (id, e))?;
                                 continue;
                             }
                         }

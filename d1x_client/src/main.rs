@@ -1,6 +1,4 @@
-mod types;
-
-use crate::types::Command;
+use d1x_protocol::{Request, Response};
 use std::io;
 use tokio::io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -17,7 +15,7 @@ async fn main() {
         if !input(&mut buffer) {continue};
         let command = buffer.trim();
 
-        let command = match command {
+        let request = match command {
             "connect" => {
                 if socket.is_some() {
                     eprintln!("Already connected");
@@ -98,7 +96,7 @@ async fn main() {
                     }
                 };
 
-                Command::Buy(symbol, price, quantity)
+                Request::Buy { symbol, price, quantity }
             }
             "sell" => {
                 println!("Enter stock symbol to sell:");
@@ -125,28 +123,28 @@ async fn main() {
                     }
                 };
 
-                Command::Sell(symbol, price, quantity)
+                Request::Sell { symbol, price, quantity }
             }
             "ohlc" => {
                 println!("Enter stock symbol to get OHLC for:");
                 if !input(&mut buffer) {continue};
                 let symbol = buffer.trim().to_string();
 
-                Command::Ohlc(symbol)
+                Request::Ohlc { symbol }
             }
             "buy orders" => {
                 println!("Enter stock symbol to get buy orders for:");
                 if !input(&mut buffer) {continue};
                 let symbol = buffer.trim().to_string();
 
-                Command::BuyOrders(symbol)
+                Request::BuyOrders { symbol }
             }
             "sell orders" => {
                 println!("Enter stock symbol to get sell orders for:");
                 if !input(&mut buffer) {continue};
                 let symbol = buffer.trim().to_string();
 
-                Command::SellOrders(symbol)
+                Request::SellOrders { symbol }
             }
 
             _ => {
@@ -156,7 +154,8 @@ async fn main() {
         };
 
         if let Some(ref mut socket) = socket {
-            if let Err(e) = socket.write(command.get_json_message().as_bytes()).await {
+            let message = serde_json::to_string(&request).expect("Request serialization should not fail.");
+            if let Err(e) = socket.write(message.as_bytes()).await {
                 eprintln!("Error sending message: {:#?}", e);
             }
         } else {
@@ -191,7 +190,10 @@ async fn read_from_socket(mut reader: ReadHalf<TcpStream>) {
                 break;
             },
             Ok(n) => {
-                market_speak(format!("Received: {}", String::from_utf8_lossy(&buffer[0..n])), false);
+                match serde_json::from_slice::<Response>(&buffer[0..n]) {
+                    Ok(response) => market_speak(format!("Received: {:#?}", response), false),
+                    Err(_) => market_speak(format!("Received unparseable data: {}", String::from_utf8_lossy(&buffer[0..n])), true),
+                }
             },
             Err(e) => {
                 market_speak(format!("Error reading from socket: {:#?}", e), true);

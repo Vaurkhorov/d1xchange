@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use d1x_protocol::{OrderLevel, Request, Response};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -335,27 +336,14 @@ pub enum Query {
 }
 
 impl Query {
-    pub fn from_json(json: &str, id: usize) -> Option<Self> {
-        let query: serde_json::Value = match serde_json::from_str(json) {
-            Ok(q) => q,
-            Err(e) => {
-                println!("Error parsing JSON: {}", e);
-                return None;
-            },
-        };
-        let query_type = query["type"].as_str()?;
-        let symbol = query["symbol"].as_str();
-        println!("symbol: {:#?}", symbol);
-        let price = query["price"].as_f64();
-        let quantity = query["quantity"].as_u64();
-
-        match query_type {
-            "buy" => Some(Query::Buy(symbol?.to_string(), Order::new(id, price?, quantity? as usize))),
-            "sell" => Some(Query::Sell(symbol?.to_string(), Order::new(id, price?, quantity? as usize))),
-            "ohlc" => Some(Query::Ohlc(symbol?.to_string())),
-            "buy_orders" => Some(Query::BuyOrders(symbol?.to_string())),
-            "sell_orders" => Some(Query::SellOrders(symbol?.to_string())),
-            _ => None,
+    /// Builds an internal `Query` from a wire-level `Request`, attaching the id of the connection it arrived on.
+    pub fn from_request(id: usize, request: Request) -> Self {
+        match request {
+            Request::Buy { symbol, price, quantity } => Query::Buy(symbol, Order::new(id, price, quantity)),
+            Request::Sell { symbol, price, quantity } => Query::Sell(symbol, Order::new(id, price, quantity)),
+            Request::Ohlc { symbol } => Query::Ohlc(symbol),
+            Request::BuyOrders { symbol } => Query::BuyOrders(symbol),
+            Request::SellOrders { symbol } => Query::SellOrders(symbol),
         }
     }
 }
@@ -382,35 +370,30 @@ pub enum QueryResponse {
 }
 
 impl QueryResponse {
-    pub fn to_json(&self) -> String {
+    /// Converts an internal `QueryResponse` into its wire-level `Response` representation.
+    pub fn to_wire(&self) -> Response {
         match self {
-            QueryResponse::Connected => r#"{"response": "connected"}"#.to_string(),
-            QueryResponse::OrderPosted => r#"{"response": "order_posted"}"#.to_string(),
-            QueryResponse::QueriedOrders(orders) => {
-                let orders: Vec<String> = orders
+            QueryResponse::Connected => Response::Connected,
+            QueryResponse::OrderPosted => Response::OrderPosted,
+            QueryResponse::QueriedOrders(orders) => Response::QueriedOrders {
+                orders: orders
                     .iter()
-                    .map(|(price, quantity)| {
-                        format!(
-                            r#"{{"price": {:.2}, "quantity": {}}}"#,
-                            price, quantity
-                        )
-                    })
-                    .collect();
-                format!(r#"{{"response": "queried_orders", "orders": [{}]}}"#, orders.join(","))
-            }
-            QueryResponse::Ohlc(open, high, low, close) => {
-                format!(
-                    r#"{{"response": "ohlc", "open": {:?}, "high": {:?}, "low": {:?}, "close": {:?}}}"#,
-                    open, high, low, close
-                )
-            }
-            QueryResponse::ExecutedTrade(trade) => {
-                format!(
-                    r#"{{"response": "executed_trade", "buyer_id": {}, "seller_id": {}, "price": {:.2}, "quantity": {}}}"#,
-                    trade.buyer_id, trade.seller_id, trade.price, trade.quantity
-                )
-            }
-            QueryResponse::SymbolNotFound => r#"{"response": "symbol_not_found"}"#.to_string(),
+                    .map(|(price, quantity)| OrderLevel { price: *price, quantity: *quantity })
+                    .collect(),
+            },
+            QueryResponse::Ohlc(open, high, low, close) => Response::Ohlc {
+                open: *open,
+                high: *high,
+                low: *low,
+                close: *close,
+            },
+            QueryResponse::ExecutedTrade(trade) => Response::ExecutedTrade {
+                buyer_id: trade.buyer_id,
+                seller_id: trade.seller_id,
+                price: trade.price,
+                quantity: trade.quantity,
+            },
+            QueryResponse::SymbolNotFound => Response::SymbolNotFound,
         }
     }
 }
