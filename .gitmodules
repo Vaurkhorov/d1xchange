@@ -1,6 +1,0 @@
-[submodule "d1x_client"]
-	path = d1x_client
-	url = https://github.com/Vaurkhorov/d1x_client.git
-[submodule "d1x"]
-	path = d1x
-	url = https://github.com/Vaurkhorov/d1x.git
