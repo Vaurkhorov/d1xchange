@@ -182,17 +182,27 @@ fn input(buffer: &mut String) -> bool {
 }
 
 async fn read_from_socket(mut reader: ReadHalf<TcpStream>) {
-    let mut buffer = [0u8; 1024];
+    let mut socket_buffer = [0u8; 1024];
+    let mut read_buffer: Vec<u8> = Vec::new();
+
     loop {
-        match reader.read(&mut buffer).await {
+        match reader.read(&mut socket_buffer).await {
             Ok(0) => {
                 market_speak("Server closed connection.".to_string(), false);
                 break;
             },
             Ok(n) => {
-                match serde_json::from_slice::<Response>(&buffer[0..n]) {
-                    Ok(response) => market_speak(format!("Received: {:#?}", response), false),
-                    Err(_) => market_speak(format!("Received unparseable data: {}", String::from_utf8_lossy(&buffer[0..n])), true),
+                read_buffer.extend_from_slice(&socket_buffer[0..n]);
+
+                match d1x_protocol::drain_json_values::<Response>(&mut read_buffer) {
+                    Ok(responses) => {
+                        for response in responses {
+                            market_speak(format!("Received: {:#?}", response), false);
+                        }
+                    }
+                    Err(()) => {
+                        market_speak("Received unparseable data, dropping buffered bytes.".to_string(), true);
+                    }
                 }
             },
             Err(e) => {

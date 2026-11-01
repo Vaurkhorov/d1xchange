@@ -2,6 +2,7 @@ mod types;
 
 use d1x_protocol::{Request, Response};
 use std::collections::HashMap;
+use std::time::Duration;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -12,6 +13,9 @@ use types::{Query, QueryResponse, Stock};
 
 const TICK_INTERVAL_MILLISECS: u64 = 10;
 const MARKET_OUTPUT_COLOUR: Color = Color::Yellow;
+/// How long a connection may sit with a partial, unfinished message buffered
+/// before it is disconnected. Resets whenever more bytes arrive.
+const PARTIAL_MESSAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
@@ -262,6 +266,8 @@ pub async fn serve(tx: mpsc::Sender<(usize, Query)>) -> Result<(), std::io::Erro
 
 async fn connection_handler(id: usize, tx: mpsc::Sender<(usize, Query)>, mut rx: mpsc::Receiver<QueryResponse>, mut socket: TcpStream, mut shutdown_signal: watch::Receiver<bool>) -> Result<(), (usize, std::io::Error)> {
     let mut socket_buffer = [0u8; 1024];
+    let mut read_buffer: Vec<u8> = Vec::new();
+    let mut idle_deadline = Box::pin(time::sleep(PARTIAL_MESSAGE_TIMEOUT));
     loop {
         select! {
             query_response = rx.recv() => {
@@ -283,33 +289,48 @@ async fn connection_handler(id: usize, tx: mpsc::Sender<(usize, Query)>, mut rx:
                 }
             }
             socket_query = socket.read(&mut socket_buffer) => {
-                let message = String::from_utf8_lossy(&socket_buffer);
-                println!("Received: {}", message);
-                let query = match socket_query {
+                let requests = match socket_query {
                     Ok(0) => {
                         break Ok(());
                     }
                     Ok(n) => {
-                        match serde_json::from_slice::<Request>(&socket_buffer[0..n]) {
-                            Ok(request) => Query::from_request(id, request),
-                            Err(e) => {
-                                println!("Error parsing JSON: {}", e);
+                        println!("Received: {}", String::from_utf8_lossy(&socket_buffer[0..n]));
+                        read_buffer.extend_from_slice(&socket_buffer[0..n]);
+
+                        let requests = match d1x_protocol::drain_json_values::<Request>(&mut read_buffer) {
+                            Ok(requests) => requests,
+                            Err(()) => {
+                                println!("Error parsing JSON, dropping buffered bytes.");
                                 let response = serde_json::to_string(&Response::MalformedRequest).expect("Response serialization should not fail.");
                                 socket.write(response.as_bytes()).await.map_err(|e| (id, e))?;
                                 continue;
                             }
+                        };
+
+                        if !read_buffer.is_empty() {
+                            idle_deadline.as_mut().reset(time::Instant::now() + PARTIAL_MESSAGE_TIMEOUT);
                         }
+
+                        requests
                     }
                     Err(e) => {
                         eprintln!("Error while reading from socket: {:#?}", e);
                         break Err((id, e));
                     }
                 };
-        
-                if let Err(e) = tx.send((id, query)).await {
-                    eprintln!("Error while sending query: {:#?}", e);
-                    break Ok(());
+
+                for request in requests {
+                    let query = Query::from_request(id, request);
+                    if let Err(e) = tx.send((id, query)).await {
+                        eprintln!("Error while sending query: {:#?}", e);
+                        return Ok(());
+                    }
                 }
+            }
+            () = &mut idle_deadline, if !read_buffer.is_empty() => {
+                println!("Connection {} left a message unfinished for too long, disconnecting.", id);
+                socket.shutdown().await.map_err(|e| (id, e))?;
+                break Ok(());
             }
             _ = shutdown_signal.changed() => {
                 socket.shutdown().await.map_err(|e| (id, e))?;
