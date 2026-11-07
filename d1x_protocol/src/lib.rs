@@ -32,6 +32,12 @@ pub enum Request {
     SellOrders {
         symbol: String,
     },
+    Subscribe {
+        symbol: String,
+    },
+    Unsubscribe {
+        symbol: String,
+    },
 }
 
 /// A response sent from the market to a client over the wire.
@@ -54,6 +60,26 @@ pub enum Response {
         seller_id: usize,
         price: f64,
         quantity: usize,
+    },
+    Subscribed {
+        symbol: String,
+    },
+    Unsubscribed {
+        symbol: String,
+    },
+    TradeBroadcast {
+        symbol: String,
+        price: f64,
+        quantity: usize,
+        /// This trade's position in its symbol's trade sequence. A gap from
+        /// the last sequence number seen means a `TradeBroadcast` was
+        /// dropped (delivery is best-effort).
+        sequence: u64,
+    },
+    OrderBookChanged {
+        symbol: String,
+        buy_orders: Vec<OrderLevel>,
+        sell_orders: Vec<OrderLevel>,
     },
     SymbolNotFound,
     MarketClosed,
@@ -149,5 +175,38 @@ mod tests {
         buffer.extend_from_slice(b"not json");
         assert!(drain_json_values::<Request>(&mut buffer).is_err());
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn subscribe_requests_round_trip() {
+        let subscribe = Request::Subscribe { symbol: "V".to_string() };
+        let json = serde_json::to_string(&subscribe).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Subscribe { symbol } if symbol == "V"));
+
+        let unsubscribe = Request::Unsubscribe { symbol: "V".to_string() };
+        let json = serde_json::to_string(&unsubscribe).unwrap();
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Unsubscribe { symbol } if symbol == "V"));
+    }
+
+    #[test]
+    fn event_responses_round_trip() {
+        let responses = vec![
+            Response::Subscribed { symbol: "V".to_string() },
+            Response::Unsubscribed { symbol: "V".to_string() },
+            Response::TradeBroadcast { symbol: "V".to_string(), price: 150.0, quantity: 10, sequence: 0 },
+            Response::OrderBookChanged {
+                symbol: "V".to_string(),
+                buy_orders: vec![OrderLevel { price: 150.0, quantity: 10 }],
+                sell_orders: vec![],
+            },
+        ];
+
+        for response in responses {
+            let json = serde_json::to_string(&response).unwrap();
+            let parsed: Response = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", parsed), format!("{:?}", response));
+        }
     }
 }

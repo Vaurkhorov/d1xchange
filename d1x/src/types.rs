@@ -22,6 +22,11 @@ pub struct Stock {
     sell_orders: Vec<Order>,
     /// Open, high, low, close prices for the stock.
     ohlc: Ohlc,
+    /// The sequence number to assign to the next trade for this stock.
+    ///
+    /// Lets a `TradeBroadcast` subscriber detect gaps caused by best-effort,
+    /// droppable delivery: a jump in sequence numbers means a trade was missed.
+    next_trade_sequence: u64,
 }
 
 impl Stock {
@@ -33,6 +38,7 @@ impl Stock {
             buy_orders: Vec::new(),
             sell_orders: Vec::new(),
             ohlc: Ohlc::new(),
+            next_trade_sequence: 0,
         }
     }
 
@@ -152,7 +158,9 @@ impl Stock {
                         sell_order.creator_id,
                         price,
                         quantity,
+                        self.next_trade_sequence,
                     ));
+                    self.next_trade_sequence += 1;
                     self.ohlc.update(price);
 
                     if buy_order.get_quantity() == 0 {
@@ -259,16 +267,20 @@ pub struct Trade {
     price: f64,
     /// The quantity of the trade.
     quantity: usize,
+    /// This trade's position in its stock's trade sequence. Lets a
+    /// `TradeBroadcast` subscriber detect a gap from dropped delivery.
+    sequence: u64,
 }
 
 impl Trade {
-    /// Creates a new trade with the given buyer ID, seller ID, price, and quantity.
-    fn new(buyer_id: usize, seller_id: usize, price: f64, quantity: usize) -> Self {
+    /// Creates a new trade with the given buyer ID, seller ID, price, quantity, and sequence number.
+    fn new(buyer_id: usize, seller_id: usize, price: f64, quantity: usize, sequence: u64) -> Self {
         Self {
             buyer_id,
             seller_id,
             price,
             quantity,
+            sequence,
         }
     }
 
@@ -278,6 +290,18 @@ impl Trade {
 
     pub fn get_seller_id(&self) -> usize {
         self.seller_id
+    }
+
+    pub fn get_price(&self) -> f64 {
+        self.price
+    }
+
+    pub fn get_quantity(&self) -> usize {
+        self.quantity
+    }
+
+    pub fn get_sequence(&self) -> u64 {
+        self.sequence
     }
 }
 
@@ -319,6 +343,15 @@ impl Ohlc {
     }
 }
 
+/// The two outgoing channels a connection is reachable through: `reply_tx`
+/// for direct replies to its own requests (guaranteed delivery), and
+/// `event_tx` for broadcast events it's subscribed to (best-effort, may
+/// drop under load so a slow subscriber can't stall delivery to anyone else).
+pub struct ConnectionChannels {
+    pub reply_tx: mpsc::Sender<QueryResponse>,
+    pub event_tx: mpsc::Sender<QueryResponse>,
+}
+
 /// A query to the market.
 pub enum Query {
     /// Post a buy order for the stock.
@@ -331,8 +364,14 @@ pub enum Query {
     BuyOrders(String),
     /// Query the pending sell orders for the stock.
     SellOrders(String),
+    /// Subscribe to events (trades, order book changes) for the stock.
+    Subscribe(String),
+    /// Unsubscribe from events for the stock.
+    Unsubscribe(String),
     /// New connection
-    Connect(mpsc::Sender<QueryResponse>),
+    Connect(ConnectionChannels),
+    /// The connection has ended; forget it and any subscriptions it held.
+    Disconnect,
 }
 
 impl Query {
@@ -344,11 +383,14 @@ impl Query {
             Request::Ohlc { symbol } => Query::Ohlc(symbol),
             Request::BuyOrders { symbol } => Query::BuyOrders(symbol),
             Request::SellOrders { symbol } => Query::SellOrders(symbol),
+            Request::Subscribe { symbol } => Query::Subscribe(symbol),
+            Request::Unsubscribe { symbol } => Query::Unsubscribe(symbol),
         }
     }
 }
 
 /// A response from the market to a query.
+#[derive(Debug, Clone)]
 pub enum QueryResponse {
     // Successes
     /// Socket tx stored.
@@ -363,6 +405,14 @@ pub enum QueryResponse {
     Ohlc(Option<f64>, Option<f64>, Option<f64>, Option<f64>),
     /// Receipt of a completed trade.
     ExecutedTrade(Trade),
+    /// Acknowledges a subscription to a stock's events.
+    Subscribed(String),
+    /// Acknowledges an unsubscription from a stock's events.
+    Unsubscribed(String),
+    /// A trade occurred on a subscribed stock (anonymized, no buyer/seller id).
+    TradeBroadcast { symbol: String, price: f64, quantity: usize, sequence: u64 },
+    /// The order book for a subscribed stock changed.
+    OrderBookChanged { symbol: String, buy_orders: Vec<(f64, usize)>, sell_orders: Vec<(f64, usize)> },
 
     // Errors
     /// The symbol provided was not found.
@@ -393,6 +443,25 @@ impl QueryResponse {
                 price: trade.price,
                 quantity: trade.quantity,
             },
+            QueryResponse::Subscribed(symbol) => Response::Subscribed { symbol: symbol.clone() },
+            QueryResponse::Unsubscribed(symbol) => Response::Unsubscribed { symbol: symbol.clone() },
+            QueryResponse::TradeBroadcast { symbol, price, quantity, sequence } => Response::TradeBroadcast {
+                symbol: symbol.clone(),
+                price: *price,
+                quantity: *quantity,
+                sequence: *sequence,
+            },
+            QueryResponse::OrderBookChanged { symbol, buy_orders, sell_orders } => Response::OrderBookChanged {
+                symbol: symbol.clone(),
+                buy_orders: buy_orders
+                    .iter()
+                    .map(|(price, quantity)| OrderLevel { price: *price, quantity: *quantity })
+                    .collect(),
+                sell_orders: sell_orders
+                    .iter()
+                    .map(|(price, quantity)| OrderLevel { price: *price, quantity: *quantity })
+                    .collect(),
+            },
             QueryResponse::SymbolNotFound => Response::SymbolNotFound,
         }
     }
@@ -418,10 +487,28 @@ mod tests {
         assert_eq!(trades[0].seller_id, 2);
         assert_eq!(trades[0].price, 150.5);
         assert_eq!(trades[0].quantity, 5);
+        assert_eq!(trades[0].sequence, 0);
 
         // Verify remaining orders
         assert_eq!(stock.get_buy_orders()[0].1, 5);
         assert!(stock.get_sell_orders().is_empty());
+    }
+
+    /// Trade sequence numbers increment per stock, across separate resolve() calls,
+    /// so a TradeBroadcast subscriber can detect a gap from dropped delivery.
+    #[test]
+    fn test_trade_sequence_increments() {
+        let mut stock = Stock::new("ORT", "Orchard de Rosa et Tulipan");
+
+        stock.add_buy_order(Order::new(1, 150.0, 5));
+        stock.add_sell_order(Order::new(2, 150.0, 5));
+        let trades = stock.resolve();
+        assert_eq!(trades[0].sequence, 0);
+
+        stock.add_buy_order(Order::new(3, 150.0, 5));
+        stock.add_sell_order(Order::new(4, 150.0, 5));
+        let trades = stock.resolve();
+        assert_eq!(trades[0].sequence, 1);
     }
 
     /// Tests whether OHLC is updated correctly.
@@ -465,5 +552,49 @@ mod tests {
         assert_eq!(sell_orders.len(), 2); // Only unique prices are kept
         assert_eq!(sell_orders[0], (140.0, 5)); // Lowest price first
         assert_eq!(sell_orders[1], (145.0, 25)); // Combined quantities
+    }
+
+    #[test]
+    fn from_request_maps_subscribe_and_unsubscribe() {
+        let query = Query::from_request(1, Request::Subscribe { symbol: "V".to_string() });
+        assert!(matches!(query, Query::Subscribe(symbol) if symbol == "V"));
+
+        let query = Query::from_request(1, Request::Unsubscribe { symbol: "V".to_string() });
+        assert!(matches!(query, Query::Unsubscribe(symbol) if symbol == "V"));
+    }
+
+    #[test]
+    fn to_wire_maps_event_responses() {
+        assert!(matches!(
+            QueryResponse::Subscribed("V".to_string()).to_wire(),
+            Response::Subscribed { symbol } if symbol == "V"
+        ));
+        assert!(matches!(
+            QueryResponse::Unsubscribed("V".to_string()).to_wire(),
+            Response::Unsubscribed { symbol } if symbol == "V"
+        ));
+
+        let wire = QueryResponse::TradeBroadcast { symbol: "V".to_string(), price: 150.0, quantity: 10, sequence: 3 }.to_wire();
+        assert!(matches!(
+            wire,
+            Response::TradeBroadcast { symbol, price, quantity, sequence } if symbol == "V" && price == 150.0 && quantity == 10 && sequence == 3
+        ));
+
+        let wire = QueryResponse::OrderBookChanged {
+            symbol: "V".to_string(),
+            buy_orders: vec![(150.0, 10)],
+            sell_orders: vec![],
+        }
+        .to_wire();
+        match wire {
+            Response::OrderBookChanged { symbol, buy_orders, sell_orders } => {
+                assert_eq!(symbol, "V");
+                assert_eq!(buy_orders.len(), 1);
+                assert_eq!(buy_orders[0].price, 150.0);
+                assert_eq!(buy_orders[0].quantity, 10);
+                assert!(sell_orders.is_empty());
+            }
+            _ => panic!("expected Response::OrderBookChanged"),
+        }
     }
 }

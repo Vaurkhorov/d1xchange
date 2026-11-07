@@ -146,6 +146,20 @@ async fn main() {
 
                 Request::SellOrders { symbol }
             }
+            "subscribe" => {
+                println!("Enter stock symbol to subscribe to:");
+                if !input(&mut buffer) {continue};
+                let symbol = buffer.trim().to_string();
+
+                Request::Subscribe { symbol }
+            }
+            "unsubscribe" => {
+                println!("Enter stock symbol to unsubscribe from:");
+                if !input(&mut buffer) {continue};
+                let symbol = buffer.trim().to_string();
+
+                Request::Unsubscribe { symbol }
+            }
 
             _ => {
                 eprintln!("Unknown command: {}", command);
